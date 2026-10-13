@@ -1,14 +1,69 @@
+# Unbreakable-app achter BunkerWeb (WAF + HTTPS via Let's Encrypt).
+#
+# Verkeer:  internet -> bunkerweb (poort 80/443) -> app (intern, poort 8080) -> db
+# De app publiceert zelf GEEN poorten meer: enkel de WAF is van buiten bereikbaar.
+#
+# Het e-mailadres voor Let's Encrypt komt uit een bestand .env naast dit bestand
+# (LE_EMAIL=jouw@adres). Dat bestand zet je NIET in de repo.
+
 services:
+  # --- De WAF zelf: NGINX + ModSecurity + OWASP Core Rule Set -----------------
+  bunkerweb:
+    image: bunkerity/bunkerweb:1.6.9
+    container_name: bunkerweb
+    ports:
+      - "80:8080/tcp"     # HTTP  (nodig voor de Let's Encrypt-controle)
+      - "443:8443/tcp"    # HTTPS
+    environment:
+      API_WHITELIST_IP: "127.0.0.0/8 10.20.30.0/24"
+    restart: unless-stopped
+    networks:
+      - bw-universe
+      - bw-services
+
+  # --- De scheduler: leest de instellingen, haalt certificaten op ---------------
+  bw-scheduler:
+    image: bunkerity/bunkerweb-scheduler:1.6.9
+    container_name: bw-scheduler
+    depends_on:
+      - bunkerweb
+    volumes:
+      - bw-storage:/data   # hier bewaart BunkerWeb o.a. je certificaten: NIET wissen!
+    environment:
+      BUNKERWEB_INSTANCES: "bunkerweb"
+      SERVER_NAME: "g01.ipv6.thelastgym.be"
+      MULTISITE: "yes"
+      API_WHITELIST_IP: "127.0.0.0/8 10.20.30.0/24"
+      SERVE_FILES: "no"
+      DISABLE_DEFAULT_SERVER: "yes"   # verzoeken met een andere hostnaam/IP worden geweigerd
+
+      # Let's Encrypt
+      AUTO_LETS_ENCRYPT: "yes"
+      EMAIL_LETS_ENCRYPT: "${LE_EMAIL:?zet LE_EMAIL=jouw@adres in een .env-bestand}"
+      LETS_ENCRYPT_CHALLENGE: "http"
+      USE_LETS_ENCRYPT_STAGING: "yes"   # eerst testen; zet op "no" zodra alles werkt
+
+      # Reverse proxy: stuur alles door naar de app
+      USE_REVERSE_PROXY: "yes"
+      g01.ipv6.thelastgym.be_REVERSE_PROXY_URL: "/"
+      g01.ipv6.thelastgym.be_REVERSE_PROXY_HOST: "http://app:8080"
+    restart: unless-stopped
+    networks:
+      - bw-universe
+
+  # --- De app: geen "ports:" meer, enkel bereikbaar via de WAF -----------------
   app:
     build: ./app
-    ports:
-      - "8080:8080"
     environment:
       ConnectionStrings__Unbreakable: "Host=db;Port=5432;Database=unbreakable;Username=unbreakable;Password=Unbr3akable!2026"
     depends_on:
       - db
     restart: unless-stopped
+    networks:
+      - bw-services   # zodat de WAF de app ziet
+      - backend       # zodat de app de database ziet
 
+  # --- De database: enkel bereikbaar voor de app -------------------------------
   db:
     image: postgres:17
     environment:
@@ -18,6 +73,21 @@ services:
     volumes:
       - dbdata:/var/lib/postgresql/data
     restart: unless-stopped
+    networks:
+      - backend
 
 volumes:
   dbdata:
+  bw-storage:
+
+networks:
+  bw-universe:
+    name: bw-universe
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.20.30.0/24
+  bw-services:
+    name: bw-services
+  backend:
+    name: backend
