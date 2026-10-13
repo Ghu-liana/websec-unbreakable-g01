@@ -1,0 +1,84 @@
+# Pipeline v1: SCA, SAST en secret scanning bij elke push.
+# Deze versie FAALT nog niet op bevindingen (continue-on-error): eerst kijken
+# we wat de scans vinden op de ongewijzigde app, daarna bouwen we de baseline
+# en de "faal bij nieuwe kritieke bevinding"-regel.
+
+name: pipeline
+
+on:
+  push:               # bij elke push, op elke branch
+  workflow_dispatch:  # en handmatig starten via het tabblad Actions
+
+# Minimale rechten voor het GITHUB_TOKEN (slide "Een pipeline beveiligen").
+# Jobs die meer nodig hebben, vragen dat zelf aan.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Secret scanning: wachtwoorden, sleutels en tokens in je repository
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: Secret scanning (Gitleaks)
+    # DSOMM: <vul hier de exacte activiteit in uit jouw opdracht 1>
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          fetch-depth: 0   # volledige git-historiek, anders ziet Gitleaks oude commits niet
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2   # TODO: vastpinnen op commit SHA
+        continue-on-error: true             # v1: rapporteren, nog niet blokkeren
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # 2. SAST: fouten in je eigen code (SQL injection, XSS, ...)
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (CodeQL ${{ matrix.language }})
+    # DSOMM: <vul hier de exacte activiteit in uit jouw opdracht 1>
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # nodig om resultaten naar het tabblad Security te sturen
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [csharp, javascript-typescript]   # de API en de SPA
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: CodeQL initialiseren
+        uses: github/codeql-action/init@v4   # TODO: vastpinnen op commit SHA
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none   # geen build nodig voor deze talen
+      - name: CodeQL analyse
+        uses: github/codeql-action/analyze@v4   # TODO: vastpinnen op commit SHA
+        with:
+          category: /language:${{ matrix.language }}
+
+  # ---------------------------------------------------------------------------
+  # 3. SCA: bibliotheken met gekende kwetsbaarheden
+  # ---------------------------------------------------------------------------
+  sca:
+    name: SCA (NuGet + JavaScript libraries)
+    # DSOMM: <vul hier de exacte activiteit in uit jouw opdracht 1>
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-dotnet@v4   # TODO: vastpinnen op commit SHA
+        with:
+          dotnet-version: 10.0.x
+
+      # NuGet-pakketten van de API (inclusief indirecte afhankelijkheden)
+      - name: NuGet-pakketten met kwetsbaarheden
+        run: |
+          dotnet restore app
+          dotnet list app package --vulnerable --include-transitive
+
+      # jQuery en Bootstrap staan als losse bestanden in wwwroot/lib en zijn dus
+      # onzichtbaar voor NuGet. Retire.js herkent ze aan hun inhoud.
+      - name: JavaScript-bibliotheken in wwwroot (retire.js)
+        run: npx --yes retire@5 --path app/wwwroot
+        continue-on-error: true   # v1: rapporteren, nog niet blokkeren
