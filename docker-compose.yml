@@ -9,7 +9,7 @@
 services:
   # --- De WAF zelf: NGINX + ModSecurity + OWASP Core Rule Set -----------------
   bunkerweb:
-    image: bunkerity/bunkerweb:1.6.9
+    image: bunkerity/bunkerweb:1.6.15
     container_name: bunkerweb
     ports:
       - "80:8080/tcp"     # HTTP  (nodig voor de Let's Encrypt-controle)
