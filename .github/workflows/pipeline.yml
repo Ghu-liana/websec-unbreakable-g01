@@ -21,7 +21,7 @@ jobs:
   secrets:
     name: Secret scanning (Gitleaks)
     # DSOMM: <vul hier de exacte activiteit in uit jouw opdracht 1>
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
@@ -38,7 +38,7 @@ jobs:
   sast:
     name: SAST (CodeQL ${{ matrix.language }})
     # DSOMM: <vul hier de exacte activiteit in uit jouw opdracht 1>
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       security-events: write   # nodig om resultaten naar het tabblad Security te sturen
@@ -64,7 +64,7 @@ jobs:
   sca:
     name: SCA (NuGet + JavaScript libraries)
     # DSOMM: <vul hier de exacte activiteit in uit jouw opdracht 1>
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - uses: actions/setup-dotnet@v4   # TODO: vastpinnen op commit SHA
