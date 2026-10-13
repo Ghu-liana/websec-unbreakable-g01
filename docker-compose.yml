@@ -3,6 +3,8 @@
 # Verkeer:  internet -> bunkerweb (poort 80/443) -> app (intern, poort 8080) -> db
 # De app publiceert zelf GEEN poorten meer: enkel de WAF is van buiten bereikbaar.
 #
+# Let op: bunkerweb en bw-scheduler moeten EXACT dezelfde versie draaien.
+#
 # Het e-mailadres voor Let's Encrypt komt uit een bestand .env naast dit bestand
 # (LE_EMAIL=jouw@adres). Dat bestand zet je NIET in de repo.
 
@@ -41,7 +43,7 @@ services:
       AUTO_LETS_ENCRYPT: "yes"
       EMAIL_LETS_ENCRYPT: "${LE_EMAIL:?zet LE_EMAIL=jouw@adres in een .env-bestand}"
       LETS_ENCRYPT_CHALLENGE: "http"
-      USE_LETS_ENCRYPT_STAGING: "no"   # eerst testen; zet op "no" zodra alles werkt
+      USE_LETS_ENCRYPT_STAGING: "no"    # "yes" = testcertificaat (niet vertrouwd door browsers)
 
       # Reverse proxy: stuur alles door naar de app
       USE_REVERSE_PROXY: "yes"
