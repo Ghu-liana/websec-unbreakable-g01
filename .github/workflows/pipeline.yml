@@ -97,6 +97,8 @@ jobs:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - name: Containers bouwen en starten
         run: docker compose up -d --build
+        env:
+          LE_EMAIL: ${{ secrets.LE_EMAIL }}
       - name: Oude images opruimen
         run: docker image prune -f
       - name: Health check
