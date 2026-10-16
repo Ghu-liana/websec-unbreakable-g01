@@ -95,16 +95,19 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: .env aanmaken
+        run: echo "LE_EMAIL=${{ secrets.LE_EMAIL }}" > .env
       - name: Containers bouwen en starten
         run: docker compose up -d --build
-        env:
-          LE_EMAIL: ${{ secrets.LE_EMAIL }}
       - name: Oude images opruimen
         run: docker image prune -f
       - name: Health check
         run: |
           for i in {1..10}; do
-            curl --fail http://localhost:8080/health && exit 0
+            curl --fail -k \
+              --resolve g01.ipv6.thelastgym.be:443:127.0.0.1 \
+              https://g01.ipv6.thelastgym.be/health && exit 0
             sleep 3
           done
           exit 1
+        
