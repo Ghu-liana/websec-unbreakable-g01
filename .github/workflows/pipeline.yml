@@ -76,9 +76,33 @@ jobs:
         run: |
           dotnet restore app
           dotnet list app package --vulnerable --include-transitive
+        continue-on-error: true   # v1: rapporteren, nog niet blokkeren
 
       # jQuery en Bootstrap staan als losse bestanden in wwwroot/lib en zijn dus
       # onzichtbaar voor NuGet. Retire.js herkent ze aan hun inhoud.
       - name: JavaScript-bibliotheken in wwwroot (retire.js)
         run: npx --yes retire@5 --path app/wwwroot
         continue-on-error: true   # v1: rapporteren, nog niet blokkeren
+
+  # deploy wijzigingen naar de server
+  deploy:
+    name: Deploy naar server
+    needs: [secrets, sast, sca]
+    if: github.ref == 'refs/heads/main'
+    runs-on: self-hosted
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Containers bouwen en starten
+        run: docker compose up -d --build
+      - name: Oude images opruimen
+        run: docker image prune -f
+      - name: Health check
+        run: |
+          for i in {1..10}; do
+            curl --fail http://localhost:8080/health && exit 0
+            sleep 3
+          done
+          exit 1
