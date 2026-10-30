@@ -1,6 +1,7 @@
 // De schermen van Unbreakable. Navigeren gebeurt met het deel na # in de URL.
 
 import { api, currentUser, setUser } from './api.js';
+import { normalize, findInvalidChars, isValidKey, encrypt, decrypt, buildMacInput, signMac, verifyMac } from './crypto.js';
 
 const app = document.getElementById('app');
 
@@ -62,13 +63,11 @@ function renderLogin() {
 
 async function renderInbox(params) {
     const user = currentUser();
-    const q = params.get('q') || '';
     const from = params.get('from') || '';
 
     const all = await api.inbox();
     const senders = [...new Set(all.map(m => m.sender))].sort();
-    const found = q ? await api.search(q) : all;
-    const messages = found.filter(m => !from || m.sender === from);
+    const messages = all.filter(m => !from || m.sender === from);
 
     app.innerHTML = `
         <h1>Inbox van ${escapeHtml(user)}</h1>
@@ -86,31 +85,27 @@ async function renderInbox(params) {
                     </select>
                 </div>
                 <div class="col-auto">
-                    <label for="q">Zoeken</label>
-                    <input id="q" class="form-control" value="${escapeHtml(q)}" />
-                </div>
-                <div class="col-auto">
                     <button type="submit" class="btn btn-secondary">Filter</button>
                 </div>
             </div>
         </form>
-        <p id="searched"></p>
+        <p class="text-muted">
+            Zoeken in de inhoud kan niet meer: de server bewaart enkel versleutelde tekst
+            en kan die niet lezen.
+        </p>
         <div id="list"></div>`;
-
-    if (q) {
-        window.jQuery('#searched').html('Je zocht naar: ' + q);
-    }
 
     const rows = messages.map(m => `
         <tr>
             <td>${escapeHtml(m.sender)}</td>
-            <td><a href="#/bericht/${m.id}">${m.subject}</a></td>
+            <td><a href="#/bericht/${m.id}">${escapeHtml(m.subject)}</a></td>
+            <td>${m.keyLineNr}</td>
             <td>${formatDate(m.sentAt)}</td>
         </tr>`).join('');
 
     document.getElementById('list').innerHTML = messages.length
         ? `<table class="table">
-               <thead><tr><th>Van</th><th>Onderwerp</th><th>Verzonden</th></tr></thead>
+               <thead><tr><th>Van</th><th>Onderwerp</th><th>Lijn</th><th>Verzonden</th></tr></thead>
                <tbody>${rows}</tbody>
            </table>`
         : '<p class="text-muted">Geen berichten.</p>';
@@ -118,9 +113,7 @@ async function renderInbox(params) {
     document.getElementById('filter').addEventListener('submit', (event) => {
         event.preventDefault();
         const next = new URLSearchParams();
-        const newQ = document.getElementById('q').value;
         const newFrom = document.getElementById('from').value;
-        if (newQ) next.set('q', newQ);
         if (newFrom) next.set('from', newFrom);
         location.hash = '#/inbox' + (next.toString() ? '?' + next.toString() : '');
     });
@@ -142,19 +135,83 @@ async function renderMessage(id) {
     const m = await api.message(id);
 
     app.innerHTML = `
-        <h1>${m.subject}</h1>
+        <h1>${escapeHtml(m.subject)}</h1>
         <dl class="row">
-            <dt class="col-sm-2">Van</dt><dd class="col-sm-10">${escapeHtml(m.sender)}</dd>
-            <dt class="col-sm-2">Aan</dt><dd class="col-sm-10">${escapeHtml(m.recipient)}</dd>
-            <dt class="col-sm-2">Verzonden</dt><dd class="col-sm-10">${formatDate(m.sentAt)}</dd>
+            <dt class="col-sm-3">Van</dt><dd class="col-sm-9">${escapeHtml(m.sender)}</dd>
+            <dt class="col-sm-3">Aan</dt><dd class="col-sm-9">${escapeHtml(m.recipient)}</dd>
+            <dt class="col-sm-3">Verzonden</dt><dd class="col-sm-9">${formatDate(m.sentAt)}</dd>
+            <dt class="col-sm-3">Lijn uit het codeboek</dt><dd class="col-sm-9">${m.keyLineNr}</dd>
         </dl>
-        <div class="card mb-3"><div class="card-body message-body" id="body"></div></div>
+
+        <p class="text-muted mb-1">Zo staat het bericht in de databank:</p>
+        <div class="card mb-3"><div class="card-body message-body" id="ciphertext"></div></div>
+
+        <form id="unlock" class="mb-3" autocomplete="off">
+            <div class="form-group">
+                <label for="key">Sleutel: lijn ${m.keyLineNr} uit je codeboek</label>
+                <input id="key" type="password" class="form-control" required autocomplete="off" />
+            </div>
+            <div class="form-group">
+                <label for="hmac-key">HMAC-sleutel</label>
+                <input id="hmac-key" type="password" class="form-control" required autocomplete="off" />
+            </div>
+            <button type="submit" class="btn btn-primary">Controleren en ontsleutelen</button>
+        </form>
+
+        <div id="result"></div>
+
         <p>
             <button id="delete" class="btn btn-outline-danger">Verwijderen</button>
             <a href="#/inbox" class="btn btn-link">Terug naar je inbox</a>
         </p>`;
 
-    document.getElementById('body').textContent = m.body;
+    document.getElementById('ciphertext').textContent = m.ciphertext;
+
+    const result = document.getElementById('result');
+
+    document.getElementById('unlock').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        result.innerHTML = '';
+
+        const keyField = document.getElementById('key');
+        const hmacField = document.getElementById('hmac-key');
+        const key = normalize(keyField.value.trim());
+        const hmacKey = hmacField.value;
+
+        try {
+            // Eerst de MAC, dan pas ontsleutelen. Klopt de MAC niet, dan is het bericht
+            // onderweg of in de databank gewijzigd en heeft ontsleutelen geen zin: je zou
+            // tekst te zien krijgen die iemand anders heeft bepaald.
+            const macInput = buildMacInput(m.keyLineNr, m.ciphertext);
+            const macIsValid = await verifyMac(hmacKey, macInput, m.mac);
+
+            if (!macIsValid) {
+                result.innerHTML = `
+                    <div class="alert alert-danger">
+                        <strong>Bericht is gewijzigd of sleutel klopt niet.</strong>
+                        De MAC komt niet overeen, dus het bericht wordt niet ontsleuteld.
+                    </div>`;
+                return;
+            }
+
+            const plaintext = decrypt(m.ciphertext, key);
+
+            result.innerHTML = `
+                <div class="alert alert-success">MAC is geldig: dit bericht is niet gewijzigd.</div>
+                <div class="card mb-3"><div class="card-body message-body" id="plaintext"></div></div>
+                <p class="text-muted">
+                    Let op: met een verkeerde codeboeklijn krijg je gewoon onleesbare tekst te zien
+                    en geen foutmelding. Een one time pad kan niet zeggen of de sleutel juist is.
+                </p>`;
+            document.getElementById('plaintext').textContent = plaintext;
+        } catch (error) {
+            result.innerHTML = `<div class="alert alert-danger">${escapeHtml(error.message)}</div>`;
+        } finally {
+            // De sleutels blijven niet rondslingeren in het formulier.
+            keyField.value = '';
+            hmacField.value = '';
+        }
+    });
 
     document.getElementById('delete').addEventListener('click', async () => {
         if (confirm('Ben je zeker dat je dit bericht wil verwijderen?')) {
@@ -174,7 +231,7 @@ async function renderNew() {
         <p class="text-muted">Van: ${escapeHtml(currentUser())}</p>
         <div class="row">
             <div class="col-md-8">
-                <form id="compose">
+                <form id="compose" autocomplete="off">
                     <div class="form-group">
                         <label for="recipient">Aan</label>
                         <input id="recipient" class="form-control" list="known-users" autocomplete="off"
@@ -186,25 +243,109 @@ async function renderNew() {
                     <div class="form-group">
                         <label for="subject">Onderwerp</label>
                         <input id="subject" class="form-control" required maxlength="100" />
+                        <small class="form-text text-muted">
+                            Het onderwerp wordt niet versleuteld: de beheerder van de server kan dit lezen.
+                        </small>
                     </div>
                     <div class="form-group">
                         <label for="text">Bericht</label>
                         <textarea id="text" class="form-control" rows="6" required maxlength="2000"></textarea>
+                        <small class="form-text text-muted" id="preview"></small>
                     </div>
-                    <button type="submit" class="btn btn-primary">Versturen</button>
+
+                    <hr />
+                    <p class="text-muted">
+                        De twee sleutels blijven in je browser. Ze worden niet verstuurd en niet bewaard.
+                    </p>
+                    <div class="form-group">
+                        <label for="line-nr">Lijn uit het codeboek</label>
+                        <input id="line-nr" type="number" class="form-control" required min="1" max="10000" />
+                        <small class="form-text text-muted">Gebruik elke lijn maar één keer.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="key">Sleutel: de inhoud van die lijn</label>
+                        <input id="key" type="password" class="form-control" required autocomplete="off" />
+                    </div>
+                    <div class="form-group">
+                        <label for="hmac-key">HMAC-sleutel (apart van het codeboek)</label>
+                        <input id="hmac-key" type="password" class="form-control" required autocomplete="off" />
+                    </div>
+
+                    <div id="error"></div>
+                    <button type="submit" class="btn btn-primary">Versleutelen en versturen</button>
                     <a href="#/inbox" class="btn btn-link">Annuleren</a>
                 </form>
             </div>
         </div>`;
 
+    const textField = document.getElementById('text');
+    const preview = document.getElementById('preview');
+    const error = document.getElementById('error');
+
+    // Tonen wat er van het bericht gemaakt wordt, zodat het bij het versturen
+    // geen verrassing is. Enkel het genormaliseerde bericht, nooit een sleutel.
+    function showPreview() {
+        const normalized = normalize(textField.value);
+        const invalid = findInvalidChars(normalized);
+
+        preview.textContent = normalized
+            ? `Wordt versleuteld als: ${normalized} (${normalized.length} tekens)`
+            : '';
+        preview.className = invalid.length
+            ? 'form-text text-danger'
+            : 'form-text text-muted';
+
+        if (invalid.length) {
+            preview.textContent += ` — niet toegelaten: ${invalid.join(' ')}`;
+        }
+    }
+
+    textField.addEventListener('input', showPreview);
+
     document.getElementById('compose').addEventListener('submit', async (event) => {
         event.preventDefault();
-        await api.send({
-            recipient: document.getElementById('recipient').value.trim(),
-            subject: document.getElementById('subject').value,
-            body: document.getElementById('text').value,
-        });
-        location.hash = '#/inbox';
+        error.innerHTML = '';
+
+        const keyField = document.getElementById('key');
+        const hmacField = document.getElementById('hmac-key');
+
+        // De sleutels bestaan enkel hier, als lokale variabele. Ze gaan niet naar
+        // localStorage, niet in de URL en niet naar de console.
+        const key = normalize(keyField.value.trim());
+        const hmacKey = hmacField.value;
+        const keyLineNr = Number(document.getElementById('line-nr').value);
+        const plaintext = normalize(textField.value);
+
+        try {
+            if (!isValidKey(key)) {
+                throw new Error('De sleutel mag enkel A-Z, 0-9 en _ bevatten.');
+            }
+
+            // encrypt controleert zelf op verboden tekens en op een te korte sleutel,
+            // maar de foutmelding is duidelijker als we de tekens hier opsommen.
+            const invalid = findInvalidChars(plaintext);
+            if (invalid.length) {
+                throw new Error(`Het bericht bevat tekens die niet versleuteld kunnen worden: ${invalid.join(' ')}. Gebruik enkel letters, cijfers en spaties.`);
+            }
+
+            const ciphertext = encrypt(plaintext, key);
+            const mac = await signMac(hmacKey, buildMacInput(keyLineNr, ciphertext));
+
+            await api.send({
+                recipient: document.getElementById('recipient').value.trim(),
+                subject: document.getElementById('subject').value,
+                ciphertext,
+                keyLineNr,
+                mac,
+            });
+
+            location.hash = '#/inbox';
+        } catch (err) {
+            error.innerHTML = `<div class="alert alert-danger">${escapeHtml(err.message)}</div>`;
+        } finally {
+            keyField.value = '';
+            hmacField.value = '';
+        }
     });
 }
 

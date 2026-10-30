@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using Newtonsoft.Json;
 using Unbreakable.Data;
@@ -13,7 +14,8 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
-// Databank aanmaken en vullen met voorbeeldberichten.
+// Databank aanmaken. Er worden geen voorbeeldberichten meer gezet: de app bewaart
+// enkel ciphertext, en daar zou een sleutel voor nodig zijn die niet in deze repo hoort.
 // De databank kan iets later opstarten dan de app, dus we proberen een paar keer.
 using (var scope = app.Services.CreateScope())
 {
@@ -25,7 +27,6 @@ using (var scope = app.Services.CreateScope())
         try
         {
             context.Database.EnsureCreated();
-            SeedData.Initialize(context);
             break;
         }
         catch (Exception ex) when (attempt < 30)
@@ -52,7 +53,13 @@ api.MapGet("/users", async (UnbreakableContext db) =>
 {
     var senders = await db.Messages.Select(m => m.Sender).Distinct().ToListAsync();
     var recipients = await db.Messages.Select(m => m.Recipient).Distinct().ToListAsync();
-    return Results.Ok(senders.Union(recipients).OrderBy(name => name).ToList());
+
+    // De vaste namen erbij, anders is de lijst leeg zolang er nog geen bericht verstuurd is.
+    return Results.Ok(senders
+        .Union(recipients)
+        .Union(SeedData.DemoUsers)
+        .OrderBy(name => name)
+        .ToList());
 });
 
 api.MapGet("/messages", async (HttpRequest request, UnbreakableContext db) =>
@@ -74,21 +81,10 @@ api.MapGet("/messages", async (HttpRequest request, UnbreakableContext db) =>
     return Results.Ok(await inbox.OrderByDescending(m => m.SentAt).ToListAsync());
 });
 
-api.MapGet("/messages/search", async (HttpRequest request, UnbreakableContext db) =>
-{
-    var user = CurrentUser(request);
-    if (string.IsNullOrEmpty(user))
-    {
-        return Results.Unauthorized();
-    }
-
-    var q = request.Query["q"].ToString();
-    var sql = "SELECT * FROM \"Messages\" WHERE \"Recipient\" = '" + user + "' " +
-              "AND (\"Subject\" ILIKE '%" + q + "%' OR \"Body\" ILIKE '%" + q + "%')";
-
-    var messages = await db.Messages.FromSqlRaw(sql).OrderByDescending(m => m.SentAt).ToListAsync();
-    return Results.Ok(messages);
-});
+// GET /messages/search is verdwenen. De server doorzocht daar de inhoud van de berichten,
+// en die heeft hij niet meer: hij ziet enkel ciphertext. Zoeken op de server kan dus niet
+// meer zonder de versleuteling ongedaan te maken. Dat is de prijs van end to end encryptie.
+// (Die query plakte trouwens ook de zoekterm en de header X-User rechtstreeks in SQL.)
 
 api.MapGet("/messages/export", async (HttpRequest request, UnbreakableContext db) =>
 {
@@ -114,6 +110,24 @@ api.MapGet("/messages/{id:int}", async (int id, UnbreakableContext db) =>
 
 api.MapPost("/messages", async (Message message, HttpRequest request, UnbreakableContext db) =>
 {
+    // De attributen op het model controleren niets uit zichzelf: een minimal API draait
+    // DataAnnotations niet automatisch. Daarom controleren we hier expliciet wat binnenkomt.
+    // De server kan de inhoud niet beoordelen (hij heeft de sleutel niet), maar wel de vorm.
+    if (message.Ciphertext == null || !Regex.IsMatch(message.Ciphertext, "^[A-Z0-9_]{1,2000}$"))
+    {
+        return Results.BadRequest("Ciphertext mag enkel A-Z, 0-9 en _ bevatten, hoogstens 2000 tekens.");
+    }
+
+    if (message.Mac == null || !Regex.IsMatch(message.Mac, "^[0-9a-f]{64}$"))
+    {
+        return Results.BadRequest("MAC moet 64 hexadecimale tekens zijn.");
+    }
+
+    if (message.KeyLineNr < 1 || message.KeyLineNr > 10000)
+    {
+        return Results.BadRequest("Het lijnnummer uit het codeboek ligt buiten het bereik.");
+    }
+
     // Geen afzender meegegeven? Dan nemen we wie je bent.
     if (string.IsNullOrEmpty(message.Sender))
     {

@@ -31,8 +31,9 @@ async function call(method, path, body) {
 export const api = {
     users: () => call('GET', '/users'),
     inbox: (from) => call('GET', '/messages' + (from ? '?from=' + encodeURIComponent(from) : '')),
-    search: (q) => call('GET', '/messages/search?q=' + encodeURIComponent(q)),
     message: (id) => call('GET', '/messages/' + id),
+    // message bevat { recipient, subject, ciphertext, keyLineNr, mac }.
+    // Het bericht zelf en de twee sleutels komen hier nooit voorbij.
     send: (message) => call('POST', '/messages', message),
     remove: (id) => call('DELETE', '/messages/' + id),
     exportJson: () => call('GET', '/messages/export'),
