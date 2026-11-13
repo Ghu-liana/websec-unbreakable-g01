@@ -96,7 +96,11 @@ jobs:
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - name: .env aanmaken
-        run: echo "LE_EMAIL=${{ secrets.LE_EMAIL }}" > .env
+        run: |
+          echo "LE_EMAIL=${{ secrets.LE_EMAIL }}" > .env
+          echo "KC_ADMIN_USER=${{ secrets.KC_ADMIN_USER }}" >> .env
+          echo "KC_ADMIN_PASSWORD=${{ secrets.KC_ADMIN_PASSWORD }}" >> .env
+          echo "KC_DB_PASSWORD=${{ secrets.KC_DB_PASSWORD }}" >> .env
       - name: Containers bouwen en starten
         run: docker compose up -d --build
       - name: Oude images opruimen
