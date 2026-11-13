@@ -1,6 +1,6 @@
 // De schermen van Unbreakable. Navigeren gebeurt met het deel na # in de URL.
 
-import { api, currentUser, setUser } from './api.js';
+import { api, currentUser, initAuth, logout } from './api.js';
 import { normalize, findInvalidChars, isValidKey, encrypt, decrypt, buildMacInput, signMac, verifyMac } from './crypto.js';
 
 const app = document.getElementById('app');
@@ -22,13 +22,23 @@ function formatDate(value) {
 
 function showWho() {
     const user = currentUser();
-    document.getElementById('who').innerHTML = user
-        ? `Je bent <strong>${escapeHtml(user)}</strong> (<a href="#/">wisselen</a>)`
+    const who = document.getElementById('who');
+    who.innerHTML = user
+        ? `Je bent <strong>${escapeHtml(user)}</strong> (<a href="#" id="logout">afmelden</a>)`
         : '';
+
+    const logoutLink = document.getElementById('logout');
+    if (logoutLink) {
+        logoutLink.addEventListener('click', (event) => {
+            event.preventDefault();
+            logout();
+        });
+    }
 }
 
-// ------------------------------------------------------------------ naam kiezen
+// ------------------------------------------------------------------ startscherm
 
+// Inloggen zelf gebeurt bij Keycloak, nog voor dit scherm getoond wordt.
 function renderLogin() {
     const user = currentUser();
     app.innerHTML = `
@@ -38,25 +48,10 @@ function renderLogin() {
         </div>
         <div class="row justify-content-center">
             <div class="col-md-5">
-                ${user ? `<p>Je gebruikt Unbreakable als <strong>${escapeHtml(user)}</strong>.
-                          <a href="#/inbox">Naar je inbox</a></p>
-                          <p>Iemand anders? Vul hieronder een andere naam in.</p>` : ''}
-                <form id="login">
-                    <div class="form-group">
-                        <label for="name">Wie ben je?</label>
-                        <input id="name" class="form-control" placeholder="bijvoorbeeld Anna"
-                               required minlength="2" maxlength="40" />
-                    </div>
-                    <button type="submit" class="btn btn-primary">Verder</button>
-                </form>
+                <p>Je bent ingelogd als <strong>${escapeHtml(user)}</strong>.
+                   <a href="#/inbox">Naar je inbox</a></p>
             </div>
         </div>`;
-
-    document.getElementById('login').addEventListener('submit', (event) => {
-        event.preventDefault();
-        setUser(document.getElementById('name').value.trim());
-        location.hash = '#/inbox';
-    });
 }
 
 // ------------------------------------------------------------------ inbox
@@ -398,5 +393,11 @@ async function route() {
     }
 }
 
-window.addEventListener('hashchange', route);
-route();
+// Eerst inloggen bij Keycloak (of terugkomen van de login), pas dan de schermen.
+try {
+    await initAuth();
+    window.addEventListener('hashchange', route);
+    route();
+} catch (error) {
+    app.innerHTML = `<div class="alert alert-danger">Inloggen mislukt: ${escapeHtml(error?.message || error)}</div>`;
+}

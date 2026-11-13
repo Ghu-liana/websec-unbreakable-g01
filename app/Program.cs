@@ -1,5 +1,8 @@
+using System.Security.Claims;
 using System.Text.RegularExpressions;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 using Newtonsoft.Json;
 using Unbreakable.Data;
 using Unbreakable.Models;
@@ -11,6 +14,59 @@ builder.Services.AddDbContext<UnbreakableContext>(options =>
 
 builder.Services.AddCors(options =>
     options.AddDefaultPolicy(policy => policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+
+// Inloggen gebeurt in de browser, bij Keycloak (OIDC, authorization code flow + PKCE).
+// De API ziet nooit een wachtwoord: hij krijgt enkel een access token en controleert dat zelf.
+//   Authority       = de issuer zoals hij in het token staat (de publieke URL)
+//   MetadataAddress = waar de API de configuratie en de publieke sleutels (JWKS) ophaalt:
+//                     rechtstreeks bij Keycloak over het interne Docker-netwerk
+//   Audience        = voor wie het token bedoeld moet zijn
+var authority = builder.Configuration["Auth:Authority"]
+    ?? throw new InvalidOperationException("Auth:Authority ontbreekt in de configuratie.");
+var metadataAddress = builder.Configuration["Auth:MetadataAddress"]
+    ?? $"{authority}/.well-known/openid-configuration";
+var audience = builder.Configuration["Auth:Audience"]
+    ?? throw new InvalidOperationException("Auth:Audience ontbreekt in de configuratie.");
+
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.Authority = authority;
+        options.MetadataAddress = metadataAddress;
+        // De metadata komt over http, maar enkel binnen het Docker-netwerk (app -> keycloak).
+        // Van buitenaf loopt alles over HTTPS via BunkerWeb.
+        options.RequireHttpsMetadata = metadataAddress.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        // Claims houden hun naam uit het token: "sub" blijft "sub".
+        options.MapInboundClaims = false;
+
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            // Handtekening: enkel met de sleutels van Keycloak, en enkel RS256.
+            // Zo wordt een token zonder handtekening ("alg": "none") of met een ander
+            // algoritme altijd geweigerd.
+            ValidateIssuerSigningKey = true,
+            RequireSignedTokens = true,
+            ValidAlgorithms = new[] { SecurityAlgorithms.RsaSha256 },
+
+            // Uitgegeven door onze realm, en niet door een andere.
+            ValidateIssuer = true,
+            ValidIssuer = authority,
+
+            // Bedoeld voor deze API. Een ID token (aud = de SPA) wordt zo ook geweigerd.
+            ValidateAudience = true,
+            ValidAudience = audience,
+
+            // Niet verlopen, en niet "nog niet geldig".
+            ValidateLifetime = true,
+            RequireExpirationTime = true,
+            ClockSkew = TimeSpan.FromSeconds(30),
+
+            NameClaimType = "preferred_username",
+        };
+    });
+
+builder.Services.AddAuthorization();
 
 var app = builder.Build();
 
@@ -44,41 +100,56 @@ app.UseCors();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+app.UseAuthentication();
+app.UseAuthorization();
+
 app.MapGet("/health", () => "ok");
 
-// De API. Wie je bent, staat voorlopig in de header X-User.
-var api = app.MapGroup("/api");
+// De API. Elk verzoek moet een geldig access token van Keycloak hebben.
+// Wie je bent, komt uit dat token (claim "sub"), niet meer uit een header.
+var api = app.MapGroup("/api").RequireAuthorization();
 
-api.MapGet("/users", async (UnbreakableContext db) =>
+// Elke gebruiker die met een geldig token langskomt, wordt (bij)gewerkt in de lijst
+// sub <-> gebruikersnaam. Beide waarden komen uit het gevalideerde token.
+api.AddEndpointFilter(async (context, next) =>
 {
-    var senders = await db.Messages.Select(m => m.Sender).Distinct().ToListAsync();
-    var recipients = await db.Messages.Select(m => m.Recipient).Distinct().ToListAsync();
-
-    // De vaste namen erbij, anders is de lijst leeg zolang er nog geen bericht verstuurd is.
-    return Results.Ok(senders
-        .Union(recipients)
-        .Union(SeedData.DemoUsers)
-        .OrderBy(name => name)
-        .ToList());
-});
-
-api.MapGet("/messages", async (HttpRequest request, UnbreakableContext db) =>
-{
-    var user = CurrentUser(request);
-    if (string.IsNullOrEmpty(user))
+    var principal = context.HttpContext.User;
+    var sub = principal.FindFirstValue("sub");
+    var username = principal.FindFirstValue("preferred_username");
+    if (string.IsNullOrEmpty(sub) || string.IsNullOrEmpty(username))
     {
         return Results.Unauthorized();
     }
+
+    var db = context.HttpContext.RequestServices.GetRequiredService<UnbreakableContext>();
+    await RememberUser(db, sub, username);
+
+    return await next(context);
+});
+
+api.MapGet("/users", async (UnbreakableContext db) =>
+{
+    return Results.Ok(await db.Users
+        .OrderBy(u => u.Username)
+        .Select(u => u.Username)
+        .ToListAsync());
+});
+
+api.MapGet("/messages", async (HttpRequest request, ClaimsPrincipal principal, UnbreakableContext db) =>
+{
+    var user = CurrentUserId(principal);
 
     var inbox = db.Messages.Where(m => m.Recipient == user);
 
     var from = request.Query["from"].ToString();
     if (!string.IsNullOrEmpty(from))
     {
-        inbox = inbox.Where(m => m.Sender == from);
+        var fromId = await UserIdFor(db, from);
+        inbox = inbox.Where(m => m.Sender == fromId);
     }
 
-    return Results.Ok(await inbox.OrderByDescending(m => m.SentAt).ToListAsync());
+    var messages = await inbox.OrderByDescending(m => m.SentAt).ToListAsync();
+    return Results.Ok(await ToViews(db, messages));
 });
 
 // GET /messages/search is verdwenen. De server doorzocht daar de inhoud van de berichten,
@@ -86,29 +157,26 @@ api.MapGet("/messages", async (HttpRequest request, UnbreakableContext db) =>
 // meer zonder de versleuteling ongedaan te maken. Dat is de prijs van end to end encryptie.
 // (Die query plakte trouwens ook de zoekterm en de header X-User rechtstreeks in SQL.)
 
-api.MapGet("/messages/export", async (HttpRequest request, UnbreakableContext db) =>
+api.MapGet("/messages/export", async (ClaimsPrincipal principal, UnbreakableContext db) =>
 {
-    var user = CurrentUser(request);
-    if (string.IsNullOrEmpty(user))
-    {
-        return Results.Unauthorized();
-    }
+    var user = CurrentUserId(principal);
 
     var messages = await db.Messages
         .Where(m => m.Recipient == user)
         .OrderBy(m => m.SentAt)
         .ToListAsync();
 
-    return Results.Text(JsonConvert.SerializeObject(messages, Formatting.Indented), "application/json");
+    var views = await ToViews(db, messages);
+    return Results.Text(JsonConvert.SerializeObject(views, Formatting.Indented), "application/json");
 });
 
 api.MapGet("/messages/{id:int}", async (int id, UnbreakableContext db) =>
 {
     var message = await db.Messages.FindAsync(id);
-    return message == null ? Results.NotFound() : Results.Ok(message);
+    return message == null ? Results.NotFound() : Results.Ok((await ToViews(db, new[] { message }))[0]);
 });
 
-api.MapPost("/messages", async (Message message, HttpRequest request, UnbreakableContext db) =>
+api.MapPost("/messages", async (Message message, ClaimsPrincipal principal, UnbreakableContext db) =>
 {
     // De attributen op het model controleren niets uit zichzelf: een minimal API draait
     // DataAnnotations niet automatisch. Daarom controleren we hier expliciet wat binnenkomt.
@@ -128,19 +196,26 @@ api.MapPost("/messages", async (Message message, HttpRequest request, Unbreakabl
         return Results.BadRequest("Het lijnnummer uit het codeboek ligt buiten het bereik.");
     }
 
-    // Geen afzender meegegeven? Dan nemen we wie je bent.
-    if (string.IsNullOrEmpty(message.Sender))
+    // De ontvanger kies je op naam; bewaard wordt zijn sub.
+    var recipientId = string.IsNullOrWhiteSpace(message.Recipient)
+        ? null
+        : await UserIdFor(db, message.Recipient.Trim());
+    if (recipientId == null)
     {
-        message.Sender = CurrentUser(request);
+        return Results.BadRequest("Onbekende ontvanger. Een ontvanger moet minstens één keer ingelogd hebben.");
     }
 
+    // De afzender komt ALTIJD uit het gevalideerde token. Wat de client eventueel
+    // als "sender" meestuurt, wordt overschreven en dus genegeerd.
+    message.Sender = CurrentUserId(principal);
+    message.Recipient = recipientId;
     message.Id = 0;
     message.SentAt = DateTime.UtcNow;
 
     db.Messages.Add(message);
     await db.SaveChangesAsync();
 
-    return Results.Created($"/api/messages/{message.Id}", message);
+    return Results.Created($"/api/messages/{message.Id}", (await ToViews(db, new[] { message }))[0]);
 });
 
 api.MapDelete("/messages/{id:int}", async (int id, UnbreakableContext db) =>
@@ -158,7 +233,69 @@ api.MapDelete("/messages/{id:int}", async (int id, UnbreakableContext db) =>
 
 app.Run();
 
-static string CurrentUser(HttpRequest request)
+// Wie je bent: de claim "sub" uit het access token dat de API net gevalideerd heeft.
+static string CurrentUserId(ClaimsPrincipal principal)
 {
-    return request.Headers["X-User"].ToString();
+    return principal.FindFirstValue("sub");
 }
+
+static async Task<string> UserIdFor(UnbreakableContext db, string username)
+{
+    return await db.Users
+        .Where(u => u.Username == username)
+        .Select(u => u.Id)
+        .FirstOrDefaultAsync();
+}
+
+static async Task RememberUser(UnbreakableContext db, string sub, string username)
+{
+    var user = await db.Users.FindAsync(sub);
+    if (user != null && user.Username == username)
+    {
+        return;
+    }
+
+    // Een oude gebruiker met dezelfde naam maar een andere sub (bv. verwijderd en opnieuw
+    // aangemaakt in Keycloak) mag de naam niet blijven claimen.
+    var stale = await db.Users.Where(u => u.Username == username && u.Id != sub).ToListAsync();
+    db.Users.RemoveRange(stale);
+
+    if (user == null)
+    {
+        db.Users.Add(new AppUser { Id = sub, Username = username });
+    }
+    else
+    {
+        user.Username = username;
+    }
+
+    try
+    {
+        await db.SaveChangesAsync();
+    }
+    catch (DbUpdateException)
+    {
+        // Twee gelijktijdige eerste verzoeken van dezelfde gebruiker: de andere was sneller.
+        db.ChangeTracker.Clear();
+    }
+}
+
+// Berichten bevatten subs. Naar de SPA sturen we de gebruikersnamen.
+static async Task<List<MessageView>> ToViews(UnbreakableContext db, IEnumerable<Message> messages)
+{
+    var list = messages.ToList();
+    var ids = list.SelectMany(m => new[] { m.Sender, m.Recipient }).Distinct().ToList();
+    var names = await db.Users
+        .Where(u => ids.Contains(u.Id))
+        .ToDictionaryAsync(u => u.Id, u => u.Username);
+
+    string NameOf(string id) => id != null && names.TryGetValue(id, out var name) ? name : id;
+
+    return list.Select(m => new MessageView(
+        m.Id, NameOf(m.Sender), NameOf(m.Recipient), m.Subject,
+        m.Ciphertext, m.KeyLineNr, m.Mac, m.SentAt)).ToList();
+}
+
+record MessageView(
+    int Id, string Sender, string Recipient, string Subject,
+    string Ciphertext, int KeyLineNr, string Mac, DateTime SentAt);

@@ -8,13 +8,15 @@ public class Message
 {
     public int Id { get; set; }
 
+    // Afzender en ontvanger zijn de "sub" uit Keycloak (een UUID), geen naam.
+    // De afzender zet de API zelf, uit het gevalideerde access token.
     [Required]
-    [StringLength(40, MinimumLength = 2)]
+    [StringLength(64)]
     [Display(Name = "Van")]
     public string Sender { get; set; }
 
     [Required]
-    [StringLength(40, MinimumLength = 2)]
+    [StringLength(64)]
     [Display(Name = "Aan")]
     public string Recipient { get; set; }
 

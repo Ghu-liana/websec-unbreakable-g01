@@ -1,12 +1,16 @@
 # Unbreakable-app achter BunkerWeb (WAF + HTTPS via Let's Encrypt).
 #
 # Verkeer:  internet -> bunkerweb (poort 80/443) -> app (intern, poort 8080) -> db
+#           internet -> bunkerweb -> /auth/realms/, /auth/resources/ -> keycloak -> keycloak-db
 # De app publiceert zelf GEEN poorten meer: enkel de WAF is van buiten bereikbaar.
+# Keycloak publiceert enkel 127.0.0.1:8081 voor de admin console (via een SSH-tunnel).
 #
 # Let op: bunkerweb en bw-scheduler moeten EXACT dezelfde versie draaien.
 #
 # Het e-mailadres voor Let's Encrypt komt uit een bestand .env naast dit bestand
 # (LE_EMAIL=jouw@adres). Dat bestand zet je NIET in de repo.
+# Ook KC_ADMIN_USER, KC_ADMIN_PASSWORD en KC_DB_PASSWORD komen uit .env
+# (de pipeline schrijft ze weg uit GitHub Secrets).
 
 services:
   # --- De WAF zelf: NGINX + ModSecurity + OWASP Core Rule Set -----------------
@@ -49,6 +53,12 @@ services:
       USE_REVERSE_PROXY: "yes"
       g01.ipv6.thelastgym.be_REVERSE_PROXY_URL: "/"
       g01.ipv6.thelastgym.be_REVERSE_PROXY_HOST: "http://app:8080"
+      # Keycloak: enkel de paden die nodig zijn om in te loggen (zoals Keycloak aanraadt).
+      # /auth/admin/ wordt NIET doorgestuurd: de admin console is niet publiek.
+      g01.ipv6.thelastgym.be_REVERSE_PROXY_URL_1: "/auth/realms/"
+      g01.ipv6.thelastgym.be_REVERSE_PROXY_HOST_1: "http://keycloak:8080"
+      g01.ipv6.thelastgym.be_REVERSE_PROXY_URL_2: "/auth/resources/"
+      g01.ipv6.thelastgym.be_REVERSE_PROXY_HOST_2: "http://keycloak:8080"
     restart: unless-stopped
     networks:
       - bw-universe
@@ -58,12 +68,18 @@ services:
     build: ./app
     environment:
       ConnectionStrings__Unbreakable: "Host=db;Port=5432;Database=unbreakable;Username=unbreakable;Password=Unbr3akable!2026"
+      # Tokens van Keycloak: issuer = de publieke URL, sleutels intern ophalen.
+      Auth__Authority: "https://g01.ipv6.thelastgym.be/auth/realms/unbreakable"
+      Auth__MetadataAddress: "http://keycloak:8080/auth/realms/unbreakable/.well-known/openid-configuration"
+      Auth__Audience: "unbreakable-api"
     depends_on:
       - db
+      - keycloak
     restart: unless-stopped
     networks:
       - bw-services   # zodat de WAF de app ziet
       - backend       # zodat de app de database ziet
+                      # (en via bw-services ook Keycloak, voor de publieke sleutels)
 
   # --- De database: enkel bereikbaar voor de app -------------------------------
   db:
@@ -78,9 +94,56 @@ services:
     networks:
       - backend
 
+  # --- Identity provider: Keycloak (OIDC) -------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.1
+    command: ["start", "--import-realm"]   # productiemodus, niet start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${KC_ADMIN_USER:?zet KC_ADMIN_USER in een .env-bestand}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${KC_ADMIN_PASSWORD:?zet KC_ADMIN_PASSWORD in een .env-bestand}"
+      KC_DB: "postgres"
+      KC_DB_URL: "jdbc:postgresql://keycloak-db:5432/keycloak"
+      KC_DB_USERNAME: "keycloak"
+      KC_DB_PASSWORD: "${KC_DB_PASSWORD:?zet KC_DB_PASSWORD in een .env-bestand}"
+      # Publieke URL: dit wordt ook de issuer in elk token.
+      KC_HOSTNAME: "https://g01.ipv6.thelastgym.be/auth"
+      # Admin console enkel via de SSH-tunnel naar 127.0.0.1:8081.
+      KC_HOSTNAME_ADMIN: "http://localhost:8081/auth"
+      # De app mag de sleutels intern ophalen op http://keycloak:8080/auth/...
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_RELATIVE_PATH: "/auth"
+      KC_HTTP_ENABLED: "true"            # TLS stopt bij BunkerWeb
+      KC_PROXY_HEADERS: "xforwarded"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      # Realm + client worden bij de eerste start geimporteerd (bestaat de realm al, dan niet opnieuw).
+      - ./keycloak/realm-unbreakable.json:/opt/keycloak/data/import/realm-unbreakable.json:ro
+    ports:
+      - "127.0.0.1:8081:8080"   # enkel lokaal op de server, niet van buitenaf
+    depends_on:
+      - keycloak-db
+    restart: unless-stopped
+    networks:
+      - bw-services        # zodat de WAF en de app Keycloak zien
+      - keycloak-backend   # zodat Keycloak zijn database ziet
+
+  # --- De database van Keycloak: apart van die van de app ---------------------
+  keycloak-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: "${KC_DB_PASSWORD:?zet KC_DB_PASSWORD in een .env-bestand}"
+    volumes:
+      - keycloak-dbdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - keycloak-backend
+
 volumes:
   dbdata:
   bw-storage:
+  keycloak-dbdata:
 
 networks:
   bw-universe:
@@ -93,3 +156,5 @@ networks:
     name: bw-services
   backend:
     name: backend
+  keycloak-backend:
+    name: keycloak-backend
