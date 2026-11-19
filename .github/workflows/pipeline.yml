@@ -101,6 +101,8 @@ jobs:
           echo "KC_ADMIN_USER=${{ secrets.KC_ADMIN_USER }}" >> .env
           echo "KC_ADMIN_PASSWORD=${{ secrets.KC_ADMIN_PASSWORD }}" >> .env
           echo "KC_DB_PASSWORD=${{ secrets.KC_DB_PASSWORD }}" >> .env
+          echo "FGA_DB_PASSWORD=${{ secrets.FGA_DB_PASSWORD }}" >> .env
+          echo "FGA_API_TOKEN=${{ secrets.FGA_API_TOKEN }}" >> .env
       - name: Containers bouwen en starten
         run: docker compose up -d --build
       - name: Oude images opruimen
