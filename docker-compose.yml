@@ -115,6 +115,9 @@ services:
       KC_HTTP_ENABLED: "true"            # TLS stopt bij BunkerWeb
       KC_PROXY_HEADERS: "xforwarded"
       KC_HEALTH_ENABLED: "true"
+      # Java mag hoogstens 70% van de containerlimiet als heap gebruiken.
+      JAVA_OPTS_KC_HEAP: "-XX:MaxRAMPercentage=70 -XX:InitialRAMPercentage=50"
+
     volumes:
       # Realm + client worden bij de eerste start geimporteerd (bestaat de realm al, dan niet opnieuw).
       - ./keycloak/realm-unbreakable.json:/opt/keycloak/data/import/realm-unbreakable.json:ro
@@ -123,6 +126,8 @@ services:
     depends_on:
       - keycloak-db
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: "1.0"
     networks:
       - bw-services        # zodat de WAF en de app Keycloak zien
       - keycloak-backend   # zodat Keycloak zijn database ziet
@@ -137,6 +142,7 @@ services:
     volumes:
       - keycloak-dbdata:/var/lib/postgresql/data
     restart: unless-stopped
+    mem_limit: 256m
     networks:
       - keycloak-backend
 
