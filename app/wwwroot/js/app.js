@@ -68,7 +68,6 @@ async function renderInbox(params) {
         <h1>Inbox van ${escapeHtml(user)}</h1>
         <p>
             <a href="#/nieuw" class="btn btn-primary">Nieuw bericht</a>
-            <button id="export" class="btn btn-outline-secondary">Exporteer als JSON</button>
         </p>
         <form id="filter" class="mb-3">
             <div class="form-row align-items-end">
@@ -112,15 +111,50 @@ async function renderInbox(params) {
         if (newFrom) next.set('from', newFrom);
         location.hash = '#/inbox' + (next.toString() ? '?' + next.toString() : '');
     });
+}
 
-    document.getElementById('export').addEventListener('click', async () => {
-        const data = await api.exportJson();
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = 'inbox.json';
-        link.click();
-        URL.revokeObjectURL(link.href);
+// ------------------------------------------------------------------ verzonden
+
+// Je verzonden berichten, om ze te kunnen verwijderen. Enkel ontvanger en datum:
+// het onderwerp en de inhoud lezen mag enkel de ontvanger (dat beslist OpenFGA).
+async function renderSent() {
+    const sent = await api.sent();
+
+    app.innerHTML = `
+        <h1>Verzonden</h1>
+        <p class="text-muted">
+            Enkel de ontvanger kan een bericht lezen. Jij kan je eigen berichten wel verwijderen.
+        </p>
+        <div id="error"></div>
+        <div id="list"></div>`;
+
+    const rows = sent.map(m => `
+        <tr>
+            <td>${escapeHtml(m.recipient)}</td>
+            <td>${formatDate(m.sentAt)}</td>
+            <td><button class="btn btn-sm btn-outline-danger" data-id="${m.id}">Verwijderen</button></td>
+        </tr>`).join('');
+
+    document.getElementById('list').innerHTML = sent.length
+        ? `<table class="table">
+               <thead><tr><th>Aan</th><th>Verzonden</th><th></th></tr></thead>
+               <tbody>${rows}</tbody>
+           </table>`
+        : '<p class="text-muted">Je hebt nog geen berichten verzonden.</p>';
+
+    document.querySelectorAll('button[data-id]').forEach(button => {
+        button.addEventListener('click', async () => {
+            if (!confirm('Ben je zeker dat je dit bericht wil verwijderen?')) {
+                return;
+            }
+            try {
+                await api.remove(button.dataset.id);
+                await renderSent();
+            } catch (err) {
+                document.getElementById('error').innerHTML =
+                    `<div class="alert alert-danger">${escapeHtml(err.message)}</div>`;
+            }
+        });
     });
 }
 
@@ -156,7 +190,6 @@ async function renderMessage(id) {
         <div id="result"></div>
 
         <p>
-            <button id="delete" class="btn btn-outline-danger">Verwijderen</button>
             <a href="#/inbox" class="btn btn-link">Terug naar je inbox</a>
         </p>`;
 
@@ -208,12 +241,8 @@ async function renderMessage(id) {
         }
     });
 
-    document.getElementById('delete').addEventListener('click', async () => {
-        if (confirm('Ben je zeker dat je dit bericht wil verwijderen?')) {
-            await api.remove(id);
-            location.hash = '#/inbox';
-        }
-    });
+    // Geen knop "Verwijderen" hier: deze pagina ziet enkel de ontvanger, en verwijderen
+    // mag enkel de afzender (via "Verzonden"). De API controleert dat hoe dan ook zelf.
 }
 
 // ------------------------------------------------------------------ bericht versturen
@@ -382,6 +411,9 @@ async function route() {
         }
         if (path === '/nieuw') {
             return await renderNew();
+        }
+        if (path === '/verzonden') {
+            return await renderSent();
         }
         const match = path.match(/^\/bericht\/(\d+)$/);
         if (match) {

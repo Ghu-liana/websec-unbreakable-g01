@@ -66,6 +66,7 @@ export const api = {
     // Geen afzender: die haalt de API uit het token.
     // Het bericht zelf en de twee sleutels komen hier nooit voorbij.
     send: (message) => call('POST', '/messages', message),
+    // Je verzonden berichten: enkel id, ontvanger en datum.
+    sent: () => call('GET', '/messages/sent'),
     remove: (id) => call('DELETE', '/messages/' + id),
-    exportJson: () => call('GET', '/messages/export'),
 };

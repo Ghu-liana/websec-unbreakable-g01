@@ -2,15 +2,17 @@
 #
 # Verkeer:  internet -> bunkerweb (poort 80/443) -> app (intern, poort 8080) -> db
 #           internet -> bunkerweb -> /auth/realms/, /auth/resources/ -> keycloak -> keycloak-db
+#           app -> openfga -> openfga-db   (enkel intern: BunkerWeb kan OpenFGA niet bereiken)
 # De app publiceert zelf GEEN poorten meer: enkel de WAF is van buiten bereikbaar.
 # Keycloak publiceert enkel 127.0.0.1:8081 voor de admin console (via een SSH-tunnel).
+# OpenFGA publiceert niets.
 #
 # Let op: bunkerweb en bw-scheduler moeten EXACT dezelfde versie draaien.
 #
 # Het e-mailadres voor Let's Encrypt komt uit een bestand .env naast dit bestand
 # (LE_EMAIL=jouw@adres). Dat bestand zet je NIET in de repo.
-# Ook KC_ADMIN_USER, KC_ADMIN_PASSWORD en KC_DB_PASSWORD komen uit .env
-# (de pipeline schrijft ze weg uit GitHub Secrets).
+# Ook KC_ADMIN_USER, KC_ADMIN_PASSWORD, KC_DB_PASSWORD, FGA_DB_PASSWORD en FGA_API_TOKEN
+# komen uit .env (de pipeline schrijft ze weg uit GitHub Secrets).
 
 services:
   # --- De WAF zelf: NGINX + ModSecurity + OWASP Core Rule Set -----------------
@@ -72,14 +74,24 @@ services:
       Auth__Authority: "https://g01.ipv6.thelastgym.be/auth/realms/unbreakable"
       Auth__MetadataAddress: "http://keycloak:8080/auth/realms/unbreakable/.well-known/openid-configuration"
       Auth__Audience: "unbreakable-api"
+      # De PDP: OpenFGA, enkel intern bereikbaar, met een preshared key.
+      Fga__ApiUrl: "http://openfga:8080"
+      Fga__ApiToken: "${FGA_API_TOKEN:?zet FGA_API_TOKEN in een .env-bestand}"
+      Fga__StoreName: "unbreakable"
+      Fga__ModelFile: "/app/openfga/model.json"
+    volumes:
+      # Het autorisatiemodel: de API laadt het op in OpenFGA, maar kan het niet wijzigen.
+      - ./openfga/model.json:/app/openfga/model.json:ro
     depends_on:
       - db
       - keycloak
+      - openfga
     restart: unless-stopped
     networks:
       - bw-services   # zodat de WAF de app ziet
       - backend       # zodat de app de database ziet
                       # (en via bw-services ook Keycloak, voor de publieke sleutels)
+      - openfga       # zodat de app de PDP ziet
 
   # --- De database: enkel bereikbaar voor de app -------------------------------
   db:
@@ -146,10 +158,72 @@ services:
     networks:
       - keycloak-backend
 
+  # --- PDP: OpenFGA (autorisatie) ---------------------------------------------
+  # Enkel bereikbaar voor de app, op het interne netwerk "openfga". Geen ports:,
+  # niet in bw-services: BunkerWeb en het internet kunnen er niet bij.
+  openfga:
+    image: openfga/openfga:v1.22.1
+    command: ["run"]
+    environment:
+      OPENFGA_DATASTORE_ENGINE: "postgres"
+      OPENFGA_DATASTORE_URI: "postgres://openfga:${FGA_DB_PASSWORD:?zet FGA_DB_PASSWORD in een .env-bestand}@openfga-db:5432/openfga?sslmode=disable"
+      # Ook intern moet wie OpenFGA aanspreekt deze sleutel meesturen.
+      OPENFGA_AUTHN_METHOD: "preshared"
+      OPENFGA_AUTHN_PRESHARED_KEYS: "${FGA_API_TOKEN:?zet FGA_API_TOKEN in een .env-bestand}"
+      # De webinterface (playground) en de metrics staan standaard aan: niet nodig.
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_METRICS_ENABLED: "false"
+      OPENFGA_LOG_FORMAT: "json"
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: "0.5"
+    networks:
+      - openfga           # zodat de app OpenFGA ziet
+      - openfga-backend   # zodat OpenFGA zijn database ziet
+
+  # Maakt eenmalig de tabellen aan in de databank van OpenFGA, en stopt dan.
+  openfga-migrate:
+    image: openfga/openfga:v1.22.1
+    command: ["migrate"]
+    environment:
+      OPENFGA_DATASTORE_ENGINE: "postgres"
+      OPENFGA_DATASTORE_URI: "postgres://openfga:${FGA_DB_PASSWORD:?zet FGA_DB_PASSWORD in een .env-bestand}@openfga-db:5432/openfga?sslmode=disable"
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - openfga-backend
+
+  # --- De database van OpenFGA: hier staan de tuples (de feiten) -------------
+  # Zonder databank houdt OpenFGA alles in het geheugen, en is na een herstart elke
+  # tuple weg: dan ziet niemand nog een bericht.
+  openfga-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: openfga
+      POSTGRES_USER: openfga
+      POSTGRES_PASSWORD: "${FGA_DB_PASSWORD:?zet FGA_DB_PASSWORD in een .env-bestand}"
+    volumes:
+      - openfga-dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openfga -d openfga"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - openfga-backend
+
 volumes:
   dbdata:
   bw-storage:
   keycloak-dbdata:
+  openfga-dbdata:
 
 networks:
   bw-universe:
@@ -164,3 +238,10 @@ networks:
     name: backend
   keycloak-backend:
     name: keycloak-backend
+  # internal: geen verbinding met het internet, enkel tussen de containers erop.
+  openfga:
+    name: openfga
+    internal: true
+  openfga-backend:
+    name: openfga-backend
+    internal: true

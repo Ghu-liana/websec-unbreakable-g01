@@ -84,10 +84,32 @@ jobs:
         run: npx --yes retire@5 --path app/wwwroot
         continue-on-error: true   # v1: rapporteren, nog niet blokkeren
 
+  # ---------------------------------------------------------------------------
+  # 4. Autorisatieregels: werkt het OpenFGA-model zoals bedoeld?
+  #    Deze job BLOKKEERT wel: een fout model mag nooit op de server komen.
+  # ---------------------------------------------------------------------------
+  authz:
+    name: Autorisatiemodel testen (OpenFGA)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Tests op model.fga (de leesbare versie)
+        run: >
+          docker run --rm -v "$PWD/openfga:/work:ro" -w /work
+          openfga/cli:v0.8.2 model test --tests model.fga.yaml
+      - name: Dezelfde tests op model.json (de versie die de API oplaadt)
+        run: |
+          mkdir -p "$RUNNER_TEMP/fga"
+          cp openfga/model.json "$RUNNER_TEMP/fga/"
+          sed 's#^model_file: ./model.fga$#model_file: ./model.json#' openfga/model.fga.yaml > "$RUNNER_TEMP/fga/model.fga.yaml"
+          grep -q '^model_file: ./model.json$' "$RUNNER_TEMP/fga/model.fga.yaml"
+          docker run --rm -v "$RUNNER_TEMP/fga:/work:ro" -w /work \
+            openfga/cli:v0.8.2 model test --tests model.fga.yaml
+
   # deploy wijzigingen naar de server
   deploy:
     name: Deploy naar server
-    needs: [secrets, sast, sca]
+    needs: [secrets, sast, sca, authz]
     if: github.ref == 'refs/heads/main'
     runs-on: self-hosted
     concurrency:

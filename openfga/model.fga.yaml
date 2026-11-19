@@ -1,0 +1,54 @@
+# Tests van de autorisatieregels. De pipeline draait ze met:
+#   fga model test --tests openfga/model.fga.yaml
+# Faalt er een, dan wordt er niet gedeployed.
+name: Unbreakable
+model_file: ./model.fga
+
+# Twee berichten: anna stuurt 1 naar bram, bram stuurt 2 naar anna.
+tuples:
+  - user: user:anna
+    relation: sender
+    object: message:1
+  - user: user:bram
+    relation: recipient
+    object: message:1
+  - user: user:bram
+    relation: sender
+    object: message:2
+  - user: user:anna
+    relation: recipient
+    object: message:2
+
+tests:
+  - name: enkel de ontvanger leest, enkel de afzender verwijdert
+    check:
+      - user: user:bram
+        object: message:1
+        assertions:
+          can_read: true
+          can_delete: false
+      - user: user:anna
+        object: message:1
+        assertions:
+          can_read: false
+          can_delete: true
+      - user: user:chris
+        object: message:1
+        assertions:
+          can_read: false
+          can_delete: false
+
+  - name: inbox en verzonden tonen enkel je eigen berichten
+    list_objects:
+      - user: user:anna
+        type: message
+        assertions:
+          can_read:
+            - message:2
+          can_delete:
+            - message:1
+      - user: user:chris
+        type: message
+        assertions:
+          can_read: []
+          can_delete: []

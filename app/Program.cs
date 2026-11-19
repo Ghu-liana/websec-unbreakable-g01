@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
-using Newtonsoft.Json;
+using Unbreakable.Authorization;
 using Unbreakable.Data;
 using Unbreakable.Models;
 
@@ -68,6 +68,10 @@ builder.Services
 
 builder.Services.AddAuthorization();
 
+// De PDP: OpenFGA beslist wie welk bericht mag lezen of verwijderen.
+// De regels zelf staan in openfga/model.fga, niet in deze code.
+builder.Services.AddSingleton<FgaAuthorizer>();
+
 var app = builder.Build();
 
 // Databank aanmaken. Er worden geen voorbeeldberichten meer gezet: de app bewaart
@@ -92,6 +96,11 @@ using (var scope = app.Services.CreateScope())
         }
     }
 }
+
+// OpenFGA klaarzetten op de achtergrond. Is het nog niet klaar, dan start de app toch
+// (zodat /health en inloggen werken); de bericht-endpoints antwoorden dan 503.
+var fgaAuthorizer = app.Services.GetRequiredService<FgaAuthorizer>();
+_ = Task.Run(() => fgaAuthorizer.WarmUpAsync(app.Lifetime.ApplicationStopping));
 
 app.UseDeveloperExceptionPage();
 app.UseCors();
@@ -127,6 +136,22 @@ api.AddEndpointFilter(async (context, next) =>
     return await next(context);
 });
 
+// Kan de PDP niet antwoorden, dan weigert de API (fail closed): niemand krijgt toegang
+// zolang OpenFGA niet beslist heeft.
+api.AddEndpointFilter(async (context, next) =>
+{
+    try
+    {
+        return await next(context);
+    }
+    catch (FgaUnavailableException ex)
+    {
+        var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+        logger.LogError(ex.InnerException, "OpenFGA niet beschikbaar");
+        return Results.Problem("De autorisatieservice is tijdelijk niet beschikbaar.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+});
+
 api.MapGet("/users", async (UnbreakableContext db) =>
 {
     return Results.Ok(await db.Users
@@ -135,12 +160,15 @@ api.MapGet("/users", async (UnbreakableContext db) =>
         .ToListAsync());
 });
 
-api.MapGet("/messages", async (HttpRequest request, ClaimsPrincipal principal, UnbreakableContext db) =>
+// Inbox: welke berichten je mag lezen, beslist OpenFGA (ListObjects op "can_read").
+// De API zoekt enkel die berichten op in de databank.
+api.MapGet("/messages", async (HttpRequest request, ClaimsPrincipal principal, UnbreakableContext db, FgaAuthorizer fga) =>
 {
-    var user = CurrentUserId(principal);
+    var allowed = await fga.ListAsync(CurrentUserId(principal), "can_read");
 
-    var inbox = db.Messages.Where(m => m.Recipient == user);
+    var inbox = db.Messages.Where(m => allowed.Contains(m.Id));
 
+    // ?from= is een zoekfilter, geen recht: het werkt enkel binnen wat OpenFGA toeliet.
     var from = request.Query["from"].ToString();
     if (!string.IsNullOrEmpty(from))
     {
@@ -152,31 +180,43 @@ api.MapGet("/messages", async (HttpRequest request, ClaimsPrincipal principal, U
     return Results.Ok(await ToViews(db, messages));
 });
 
+// Verzonden: de berichten die je mag verwijderen (ListObjects op "can_delete").
+// Enkel id, ontvanger en datum: onderwerp en inhoud lezen mag enkel de ontvanger.
+api.MapGet("/messages/sent", async (ClaimsPrincipal principal, UnbreakableContext db, FgaAuthorizer fga) =>
+{
+    var allowed = await fga.ListAsync(CurrentUserId(principal), "can_delete");
+
+    var messages = await db.Messages
+        .Where(m => allowed.Contains(m.Id))
+        .OrderByDescending(m => m.SentAt)
+        .ToListAsync();
+
+    var views = await ToViews(db, messages);
+    return Results.Ok(views.Select(v => new SentView(v.Id, v.Recipient, v.SentAt)));
+});
+
 // GET /messages/search is verdwenen. De server doorzocht daar de inhoud van de berichten,
 // en die heeft hij niet meer: hij ziet enkel ciphertext. Zoeken op de server kan dus niet
 // meer zonder de versleuteling ongedaan te maken. Dat is de prijs van end to end encryptie.
 // (Die query plakte trouwens ook de zoekterm en de header X-User rechtstreeks in SQL.)
+//
+// GET /messages/export is ook verdwenen: het gaf niets wat de inbox niet al toont, en
+// elk endpoint minder is een endpoint minder om aan te vallen.
 
-api.MapGet("/messages/export", async (ClaimsPrincipal principal, UnbreakableContext db) =>
+// Eén bericht lezen: OpenFGA beslist (Check op "can_read"). Mag het niet, dan antwoorden
+// we 404, net als voor een bericht dat niet bestaat: zo verraden we niet welke id's bestaan.
+api.MapGet("/messages/{id:int}", async (int id, ClaimsPrincipal principal, UnbreakableContext db, FgaAuthorizer fga) =>
 {
-    var user = CurrentUserId(principal);
+    if (!await fga.CanAsync(CurrentUserId(principal), "can_read", id))
+    {
+        return Results.NotFound();
+    }
 
-    var messages = await db.Messages
-        .Where(m => m.Recipient == user)
-        .OrderBy(m => m.SentAt)
-        .ToListAsync();
-
-    var views = await ToViews(db, messages);
-    return Results.Text(JsonConvert.SerializeObject(views, Formatting.Indented), "application/json");
-});
-
-api.MapGet("/messages/{id:int}", async (int id, UnbreakableContext db) =>
-{
     var message = await db.Messages.FindAsync(id);
     return message == null ? Results.NotFound() : Results.Ok((await ToViews(db, new[] { message }))[0]);
 });
 
-api.MapPost("/messages", async (Message message, ClaimsPrincipal principal, UnbreakableContext db) =>
+api.MapPost("/messages", async (Message message, ClaimsPrincipal principal, UnbreakableContext db, FgaAuthorizer fga) =>
 {
     // De attributen op het model controleren niets uit zichzelf: een minimal API draait
     // DataAnnotations niet automatisch. Daarom controleren we hier expliciet wat binnenkomt.
@@ -215,11 +255,31 @@ api.MapPost("/messages", async (Message message, ClaimsPrincipal principal, Unbr
     db.Messages.Add(message);
     await db.SaveChangesAsync();
 
-    return Results.Created($"/api/messages/{message.Id}", (await ToViews(db, new[] { message }))[0]);
+    // De feiten naar de PDP: wie is de afzender, wie de ontvanger. Lukt dat niet, dan
+    // halen we het bericht terug weg: een bericht zonder feiten kan niemand lezen.
+    try
+    {
+        await fga.WriteMessageAsync(message.Id, message.Sender, message.Recipient);
+    }
+    catch (FgaUnavailableException)
+    {
+        db.Messages.Remove(message);
+        await db.SaveChangesAsync();
+        throw;
+    }
+
+    // Enkel het id terug: de inhoud lezen mag enkel de ontvanger.
+    return Results.Created($"/api/messages/{message.Id}", new { id = message.Id });
 });
 
-api.MapDelete("/messages/{id:int}", async (int id, UnbreakableContext db) =>
+// Verwijderen: OpenFGA beslist (Check op "can_delete"). Mag het niet, dan 404 (zie hierboven).
+api.MapDelete("/messages/{id:int}", async (int id, ClaimsPrincipal principal, UnbreakableContext db, FgaAuthorizer fga) =>
 {
+    if (!await fga.CanAsync(CurrentUserId(principal), "can_delete", id))
+    {
+        return Results.NotFound();
+    }
+
     var message = await db.Messages.FindAsync(id);
     if (message == null)
     {
@@ -228,6 +288,19 @@ api.MapDelete("/messages/{id:int}", async (int id, UnbreakableContext db) =>
 
     db.Messages.Remove(message);
     await db.SaveChangesAsync();
+
+    // De feiten over dit bericht mogen nu ook weg. Lukt dat niet, dan is dat geen
+    // veiligheidsprobleem: het bericht bestaat niet meer, en bij de volgende start
+    // ruimt de API verouderde feiten op.
+    try
+    {
+        await fga.DeleteMessageAsync(message.Id, message.Sender, message.Recipient);
+    }
+    catch (FgaUnavailableException ex)
+    {
+        app.Logger.LogWarning(ex.InnerException, "Feiten over bericht {Id} niet gewist in OpenFGA", id);
+    }
+
     return Results.NoContent();
 });
 
@@ -299,3 +372,5 @@ static async Task<List<MessageView>> ToViews(UnbreakableContext db, IEnumerable<
 record MessageView(
     int Id, string Sender, string Recipient, string Subject,
     string Ciphertext, int KeyLineNr, string Mac, DateTime SentAt);
+
+record SentView(int Id, string Recipient, DateTime SentAt);
