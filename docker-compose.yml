@@ -61,6 +61,8 @@ services:
       g01.ipv6.thelastgym.be_REVERSE_PROXY_HOST_1: "http://keycloak:8080"
       g01.ipv6.thelastgym.be_REVERSE_PROXY_URL_2: "/auth/resources/"
       g01.ipv6.thelastgym.be_REVERSE_PROXY_HOST_2: "http://keycloak:8080"
+      # DELETE is nodig om berichten te verwijderen. Andere methodes (PUT, PATCH, ...) blijven geweigerd.
+      g01.ipv6.thelastgym.be_ALLOWED_METHODS: "GET|POST|HEAD|DELETE"
     restart: unless-stopped
     networks:
       - bw-universe
